@@ -1,0 +1,74 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+#include <Adafruit_MPU6050.h>
+
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+Adafruit_MPU6050 mpu;
+
+/* ===== Magnetometer Calibration ===== */
+float offsetX = -0.545;
+float offsetY = -5.09;
+float offsetZ = -9.34;
+
+float scaleX = 1.152;
+float scaleY = 1.029;
+float scaleZ = 0.861;
+/* ==================================== */
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Magnetometer init
+  if (!mag.begin()) {
+    Serial.println("HMC5883L not detected!");
+    while (1);
+  }
+
+  // MPU6050 init
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not detected!");
+    while (1);
+  }
+
+  // MPU settings
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("Sensors ready");
+}
+
+void loop() {
+
+  /* ---------- Magnetometer ---------- */
+  sensors_event_t magEvent;
+  mag.getEvent(&magEvent);
+
+  float magX = (magEvent.magnetic.x - offsetX) * scaleX;
+  float magY = (magEvent.magnetic.y - offsetY) * scaleY;
+  float magZ = (magEvent.magnetic.z - offsetZ) * scaleZ;
+
+  /* ---------- MPU6050 ---------- */
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+
+  /* ---------- Output ---------- */
+  Serial.print("MAG: ");
+  Serial.print(magX); Serial.print(", ");
+  Serial.print(magY); Serial.print(", ");
+  Serial.print(magZ);
+
+  Serial.print(" | ACC: ");
+  Serial.print(accel.acceleration.x); Serial.print(", ");
+  Serial.print(accel.acceleration.y); Serial.print(", ");
+  Serial.print(accel.acceleration.z);
+
+  Serial.print(" | GYRO: ");
+  Serial.print(gyro.gyro.x); Serial.print(", ");
+  Serial.print(gyro.gyro.y); Serial.print(", ");
+  Serial.println(gyro.gyro.z);
+
+  delay(100);
+}
