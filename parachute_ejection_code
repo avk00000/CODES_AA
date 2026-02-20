@@ -1,0 +1,1066 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <MS5611.h>
+#include <Adafruit_BMP280.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <SD.h>
+
+// Sensor objects
+Adafruit_MPU6050 mpu;
+MS5611 ms5611;
+Adafruit_BMP280 bmp280;
+Servo parachuteServo;
+
+// HC-12 Serial Communication (Using Serial2)
+#define HC12_TX 17  // ESP32 TX2 to HC-12 RX
+#define HC12_RX 16  // ESP32 RX2 to HC-12 TX
+HardwareSerial HC12(2);
+
+// Pin definitions
+const int servoPin = 13;
+const int statusLedPin = 25;
+const int deployLedPin = 26;
+const int chipSelect = 5;
+
+// SD card file
+File dataFile;
+bool sdInitialized = false;
+int sessionNumber = 1;
+String fileName = "";
+
+// Deployment thresholds (Optimized for reliability)
+const float ALTITUDE_ACTIVATION_THRESHOLD = 0.5;    // 0.5 meters for testing
+const float FREE_FALL_ACCELERATION_THRESHOLD = 2.0; // 2.5 m/s² (optimized) 3.0
+const float ORIENTATION_THRESHOLD = 65.0;           // 65 degrees (optimized)
+const unsigned long CONFIRMATION_TIME = 400;        // 800ms (faster response)
+
+// ADVANCED FREE FALL DETECTION THRESHOLDS
+const float FREE_FALL_TOTAL_ACC_MIN = 0.3;          // Minimum total acceleration (m/s²) - near zero-g 1.0
+const float FREE_FALL_TOTAL_ACC_MAX = 2.0;          // Maximum total acceleration during free fall 4.0
+const float ALTITUDE_DROP_RATE_THRESHOLD = -4.0;    // Altitude dropping faster than -1.5 m/s
+const int ALTITUDE_DROP_SAMPLES = 5;                // Number of samples to confirm altitude drop 5
+const float XY_ACCELERATION_THRESHOLD = 2.0;        // Max lateral acceleration during free fall 3.0
+const float VERTICAL_VELOCITY_THRESHOLD = -6.0;     // Minimum descent rate (m/s) -2.0
+
+// System state variables
+bool systemActive = false;
+bool parachuteDeployed = false;
+unsigned long fallStartTime = 0;
+unsigned long systemStartTime = 0;
+String triggerReason = "";
+String deploymentCondition = "";  // NEW: Store which condition triggered deployment
+
+// Variables to store detection values
+float detectionAltitude = 0;
+float detectionRoll = 0;
+float detectionPitch = 0;
+float detectionAccX = 0;
+float detectionAccY = 0;
+float detectionAccZ = 0;
+float detectionTimestamp = 0;
+float detectionTotalAcc = 0;
+float detectionVerticalVelocity = 0;
+
+// Altitude history for rate of descent calculation
+const int ALTITUDE_HISTORY_SIZE = 10;
+float altitudeHistory[ALTITUDE_HISTORY_SIZE];
+unsigned long altitudeTimeHistory[ALTITUDE_HISTORY_SIZE];
+int altitudeHistoryIndex = 0;
+bool altitudeHistoryFilled = false;
+
+// Dual sensor calibration and fusion
+float referencePressureMS5611 = 0.0;
+float referencePressureBMP280 = 0.0;
+bool ms5611Available = false;
+bool bmp280Available = false;
+
+// Sensor reliability tracking (for adaptive weighting)
+float ms5611Weight = 0.5;  // Initial equal weight
+float bmp280Weight = 0.5;
+const int RELIABILITY_WINDOW = 20;
+float ms5611ReadingsHistory[RELIABILITY_WINDOW];
+float bmp280ReadingsHistory[RELIABILITY_WINDOW];
+int reliabilityIndex = 0;
+
+// Altitude smoothing with Kalman-like filtering
+const int ALTITUDE_FILTER_SIZE = 15;
+float altitudeReadings[ALTITUDE_FILTER_SIZE];
+int altitudeReadingsIndex = 0;
+float altitudeSum = 0;
+bool altitudeFilterFilled = false;
+
+// Additional filtering for sensor fusion
+float lastFusedAltitude = 0;
+float altitudeVelocity = 0;
+const float KALMAN_Q = 0.01;  // Process noise
+const float KALMAN_R = 0.1;   // Measurement noise
+float kalmanP = 1.0;          // Estimation error
+
+// Sensor reading intervals - INCREASED RATES
+unsigned long lastAltitudeReadTime = 0;
+const unsigned long ALTITUDE_READ_INTERVAL = 30;    // INCREASED: 30ms (was 50ms)
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 200;             // INCREASED: 200ms (was 500ms)
+
+// HC-12 transmission intervals - INCREASED RATE
+unsigned long lastHC12TransmitTime = 0;
+const unsigned long HC12_TRANSMIT_INTERVAL = 500;   // INCREASED: 500ms (was 1000ms)
+
+// Sensor diagnostics
+unsigned long lastDiagnosticTime = 0;
+const unsigned long DIAGNOSTIC_INTERVAL = 10000; // 10 seconds
+
+// Free fall detection state tracking
+bool freeFallConditionMet = false;
+bool rollConditionMet = false;
+bool pitchConditionMet = false;
+unsigned long freeFallDetectionStart = 0;
+unsigned long rollDetectionStart = 0;
+unsigned long pitchDetectionStart = 0;
+
+void setup() {
+  // Initialize pins
+  pinMode(statusLedPin, OUTPUT);
+  pinMode(deployLedPin, OUTPUT);
+  
+  // Start with both LEDs ON
+  digitalWrite(statusLedPin, HIGH);
+  digitalWrite(deployLedPin, HIGH);
+  
+  // Initialize serial for debugging
+  Serial.begin(115200);
+  while (!Serial) {
+    ; // wait for serial port to connect
+  }
+  
+  // Initialize HC-12 Serial Communication
+  HC12.begin(9600, SERIAL_8N1, HC12_RX, HC12_TX);
+  delay(100);
+  Serial.println("HC-12 Wireless Module Initialized");
+  sendHC12Data("SYSTEM:HC-12 Initialized");
+  
+  Serial.println("\n==============================================");
+  Serial.println("    PARACHUTE EJECTION SYSTEM INITIALIZATION");
+  Serial.println("    DUAL SENSOR FUSION (MS5611 + BMP280)");
+  Serial.println("    ADVANCED FREE FALL DETECTION");
+  Serial.println("==============================================\n");
+  
+  // Initialize I2C bus
+  Wire.begin();
+  Wire.setClock(400000);
+  Serial.println("I2C Bus Initialized");
+  sendHC12Data("SYSTEM:I2C Bus Initialized");
+  
+  // Initialize SD card first
+  if (!initializeSDCard()) {
+    Serial.println("WARNING: Continuing without SD card logging");
+    sendHC12Data("WARNING:SD Card logging disabled");
+  } else {
+    sendHC12Data("SYSTEM:SD Card initialized");
+  }
+  
+  // Initialize sensors
+  if (!initializeMPU6050()) {
+    systemHalt("MPU6050 initialization failed!");
+  }
+  sendHC12Data("SYSTEM:MPU6050 Initialized");
+  
+  // Initialize MS5611 (Primary barometer)
+  if (!initializeMS5611()) {
+    Serial.println("WARNING: MS5611 not available - Will use BMP280 only");
+    sendHC12Data("WARNING:MS5611 not available");
+    ms5611Available = false;
+  } else {
+    ms5611Available = true;
+    sendHC12Data("SYSTEM:MS5611 Initialized (Primary)");
+  }
+  
+  // Initialize BMP280 (Secondary barometer)
+  if (!initializeBMP280()) {
+    Serial.println("WARNING: BMP280 not available - Will use MS5611 only");
+    sendHC12Data("WARNING:BMP280 not available");
+    bmp280Available = false;
+  } else {
+    bmp280Available = true;
+    sendHC12Data("SYSTEM:BMP280 Initialized (Secondary)");
+  }
+  
+  // Check if at least one barometer is available
+  if (!ms5611Available && !bmp280Available) {
+    systemHalt("CRITICAL: No barometric sensors available!");
+  }
+  
+  // Initialize altitude filter
+  initializeAltitudeFilter();
+  
+  // Calibrate altitude to zero at startup with dual sensor fusion
+  calibrateAltitudeDualSensor();
+  
+  // Initialize servo
+  parachuteServo.attach(servoPin);
+  parachuteServo.write(0);
+  Serial.println("Servo Motor Initialized (Closed Position)");
+  sendHC12Data("SYSTEM:Servo Initialized");
+  
+  // System starts automatically when powered on
+  systemStartTime = millis();
+  
+  Serial.println("\n>>> SYSTEM ACTIVATED <<<");
+  Serial.println(">>> ADVANCED FREE FALL DETECTION ENABLED <<<");
+  Serial.println(">>> WAITING FOR ALTITUDE THRESHOLD <<<");
+  Serial.printf("Activation Altitude: %.1f meters\n", ALTITUDE_ACTIVATION_THRESHOLD);
+  Serial.printf("Free Fall Threshold: %.1f m/s²\n", FREE_FALL_ACCELERATION_THRESHOLD);
+  Serial.printf("Orientation Threshold: %.1f degrees\n", ORIENTATION_THRESHOLD);
+  Serial.printf("Altitude Drop Rate: %.1f m/s\n", ALTITUDE_DROP_RATE_THRESHOLD);
+  Serial.printf("Confirmation Time: %d ms\n", CONFIRMATION_TIME);
+  Serial.printf("Sensor Fusion: MS5611=%s, BMP280=%s\n", 
+                ms5611Available ? "ACTIVE" : "INACTIVE",
+                bmp280Available ? "ACTIVE" : "INACTIVE");
+  
+  sendHC12Data("STATUS:SYSTEM ACTIVATED");
+  sendHC12Data("STATUS:ADVANCED FREE FALL DETECTION");
+  sendHC12Data("STATUS:WAITING FOR ALTITUDE");
+  
+  String thresholds = "THRESHOLD:Alt=" + String(ALTITUDE_ACTIVATION_THRESHOLD, 1) + 
+                      "m,FreeFall=" + String(FREE_FALL_ACCELERATION_THRESHOLD, 1) + 
+                      "m/s²,Orient=" + String(ORIENTATION_THRESHOLD, 1) + "°";
+  sendHC12Data(thresholds);
+  
+  String sensorStatus = "SENSORS:MS5611=" + String(ms5611Available ? "OK" : "FAIL") + 
+                       ",BMP280=" + String(bmp280Available ? "OK" : "FAIL");
+  sendHC12Data(sensorStatus);
+  
+  logSessionHeader();
+  logData("SYSTEM_START", "Advanced free fall detection with dual sensor fusion enabled");
+  logData("WAITING_FOR_ALTITUDE", "Drone yet to reach required altitude for system activation");
+}
+
+void loop() {
+  if (parachuteDeployed) {
+    // After deployment, maintain system state
+    blinkLED(deployLedPin, 500);
+    logData("PARACHUTE_STATUS", "Parachute deployed - System in safe mode");
+    
+    // Send deployment status via HC-12 periodically
+    static unsigned long lastDeployMsg = 0;
+    if (millis() - lastDeployMsg >= 2000) {
+      lastDeployMsg = millis();
+      sendHC12Data("STATUS:Parachute Deployed - Safe Mode");
+      sendHC12Data("DEPLOY_REASON:" + deploymentCondition);  // Send deployment reason
+    }
+    
+    delay(1000);
+    return;
+  }
+  
+  unsigned long currentTime = millis();
+  float timestamp = (currentTime - systemStartTime) / 1000.0;
+  
+  // Read sensors at higher rate
+  if (currentTime - lastAltitudeReadTime >= ALTITUDE_READ_INTERVAL) {
+    lastAltitudeReadTime = currentTime;
+    readAndFuseAltitude();
+  }
+  
+  float roll = 0, pitch = 0;
+  float accelerationX = 0, accelerationY = 0, accelerationZ = 0;
+  readMPU6050(roll, pitch, accelerationX, accelerationY, accelerationZ);
+  
+  float altitude = getSmoothedAltitude();
+  
+  // Store altitude history for rate calculation
+  storeAltitudeHistory(altitude, currentTime);
+  
+  // Send live sensor data via HC-12 at higher rate
+  if (currentTime - lastHC12TransmitTime >= HC12_TRANSMIT_INTERVAL) {
+    lastHC12TransmitTime = currentTime;
+    sendLiveSensorData(timestamp, roll, pitch, accelerationX, accelerationY, accelerationZ, altitude);
+  }
+  
+  // Send sensor diagnostics periodically
+  if (currentTime - lastDiagnosticTime >= DIAGNOSTIC_INTERVAL) {
+    lastDiagnosticTime = currentTime;
+    sendSensorDiagnostics();
+  }
+  
+  // Check altitude activation
+  if (!systemActive) {
+    if (altitude >= ALTITUDE_ACTIVATION_THRESHOLD) {
+      systemActive = true;
+      Serial.println("\n>>> SYSTEM ARMED <<<");
+      Serial.println(">>> MONITORING FOR FREE FALL CONDITIONS <<<");
+      digitalWrite(statusLedPin, HIGH);
+      logData("SYSTEM_ARMED", "Altitude threshold reached. Monitoring active.");
+      logColumnHeaders();
+      
+      // Send armed alert via HC-12
+      sendHC12Data("ALERT:SYSTEM ARMED!");
+      sendHC12Data("ALERT:Altitude threshold reached");
+      sendHC12Data("STATUS:Monitoring for free fall");
+    }
+    
+    // Log waiting status periodically
+    if (currentTime - lastLogTime >= LOG_INTERVAL) {
+      lastLogTime = currentTime;
+      String altMsg = "Current altitude: " + String(altitude, 2) + "m, Waiting for: " + String(ALTITUDE_ACTIVATION_THRESHOLD, 1) + "m";
+      logData("WAITING", altMsg);
+      Serial.println(altMsg);
+    }
+    delay(20);  // Reduced delay for faster response
+    return;
+  }
+  
+  // Regular logging when armed at higher rate
+  if (currentTime - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = currentTime;
+    logSensorData(timestamp, roll, pitch, accelerationX, accelerationY, accelerationZ, altitude, "NORMAL");
+  }
+  
+  // Check for ALL deployment conditions
+  checkDeploymentConditions(timestamp, altitude, roll, pitch, accelerationX, accelerationY, accelerationZ);
+  
+  delay(20);  // Reduced delay for faster loop
+}
+
+// Function to send data via HC-12
+void sendHC12Data(String data) {
+  HC12.println(data);
+  delay(10); // Small delay to ensure transmission
+}
+
+// Function to send live sensor data in formatted way
+void sendLiveSensorData(float timestamp, float roll, float pitch, float accX, float accY, float accZ, float altitude) {
+  // Calculate additional parameters
+  float totalAcc = sqrt(accX*accX + accY*accY + accZ*accZ);
+  float verticalVelocity = calculateVerticalVelocity();
+  
+  // Create formatted data string
+  String dataPacket = "DATA:";
+  dataPacket += "T=" + String(timestamp, 2) + "s,";
+  dataPacket += "R=" + String(roll, 2) + "°,";
+  dataPacket += "P=" + String(pitch, 2) + "°,";
+  dataPacket += "AX=" + String(accX, 2) + ",";
+  dataPacket += "AY=" + String(accY, 2) + ",";
+  dataPacket += "AZ=" + String(accZ, 2) + ",";
+  dataPacket += "ALT=" + String(altitude, 2) + "m,";
+  dataPacket += "TotalAcc=" + String(totalAcc, 2) + ",";
+  dataPacket += "VelZ=" + String(verticalVelocity, 2);
+  
+  sendHC12Data(dataPacket);
+  
+  // Send system status
+  if (!systemActive) {
+    sendHC12Data("STATUS:Waiting for altitude activation");
+  } else {
+    sendHC12Data("STATUS:Armed - Monitoring");
+  }
+}
+
+// Function to send sensor diagnostics
+void sendSensorDiagnostics() {
+  String diag = "DIAGNOSTICS:";
+  diag += "MS5611_Weight=" + String(ms5611Weight, 3) + ",";
+  diag += "BMP280_Weight=" + String(bmp280Weight, 3) + ",";
+  diag += "Kalman_P=" + String(kalmanP, 4);
+  sendHC12Data(diag);
+}
+
+void storeAltitudeHistory(float altitude, unsigned long timestamp) {
+  altitudeHistory[altitudeHistoryIndex] = altitude;
+  altitudeTimeHistory[altitudeHistoryIndex] = timestamp;
+  
+  altitudeHistoryIndex = (altitudeHistoryIndex + 1) % ALTITUDE_HISTORY_SIZE;
+  if (altitudeHistoryIndex == 0) altitudeHistoryFilled = true;
+}
+
+float calculateVerticalVelocity() {
+  if (!altitudeHistoryFilled && altitudeHistoryIndex < 2) {
+    return 0.0;
+  }
+  
+  int samples = altitudeHistoryFilled ? ALTITUDE_HISTORY_SIZE : altitudeHistoryIndex;
+  if (samples < 2) return 0.0;
+  
+  // Get oldest and newest samples
+  int oldestIndex = altitudeHistoryFilled ? altitudeHistoryIndex : 0;
+  int newestIndex = (altitudeHistoryIndex - 1 + ALTITUDE_HISTORY_SIZE) % ALTITUDE_HISTORY_SIZE;
+  
+  float altitudeDiff = altitudeHistory[newestIndex] - altitudeHistory[oldestIndex];
+  float timeDiff = (altitudeTimeHistory[newestIndex] - altitudeTimeHistory[oldestIndex]) / 1000.0; // Convert to seconds
+  
+  if (timeDiff > 0) {
+    return altitudeDiff / timeDiff;  // meters per second
+  }
+  
+  return 0.0;
+}
+
+bool isAltitudeDropping() {
+  float verticalVelocity = calculateVerticalVelocity();
+  return (verticalVelocity < ALTITUDE_DROP_RATE_THRESHOLD);
+}
+
+// ENHANCED FREE FALL DETECTION WITH MULTIPLE PARAMETERS
+void checkDeploymentConditions(float timestamp, float altitude, float roll, float pitch, 
+                               float accX, float accY, float accZ) {
+  
+  // Calculate total acceleration (magnitude)
+  float totalAcceleration = sqrt(accX*accX + accY*accY + accZ*accZ);
+  
+  // Calculate vertical velocity
+  float verticalVelocity = calculateVerticalVelocity();
+  
+  // Calculate lateral acceleration
+  float lateralAcceleration = sqrt(accX*accX + accY*accY);
+  
+  // ==================== CONDITION 1: ADVANCED FREE FALL DETECTION ====================
+  bool advancedFreeFallDetected = false;
+  String freeFallReason = "";
+  
+  // Multi-parameter free fall check
+  bool lowVerticalAcc = (fabs(accZ) < FREE_FALL_ACCELERATION_THRESHOLD && fabs(accZ) > 0.1);
+  bool nearZeroG = (totalAcceleration >= FREE_FALL_TOTAL_ACC_MIN && totalAcceleration <= FREE_FALL_TOTAL_ACC_MAX);
+  bool rapidDescent = isAltitudeDropping();
+  bool lowLateralAcc = (lateralAcceleration < XY_ACCELERATION_THRESHOLD);
+  bool fallingDown = (verticalVelocity < VERTICAL_VELOCITY_THRESHOLD);
+  
+  // Count how many conditions are met
+  int freeFallScore = 0;
+  if (lowVerticalAcc) freeFallScore++;
+  if (nearZeroG) freeFallScore++;
+  if (rapidDescent) freeFallScore++;
+  if (lowLateralAcc) freeFallScore++;
+  if (fallingDown) freeFallScore++;
+  
+  // Require at least 3 out of 5 conditions for robust detection
+  if (freeFallScore >= 3) {
+    advancedFreeFallDetected = true;
+    
+    // Build detailed reason
+    freeFallReason = "FreeFall[Score:" + String(freeFallScore) + "/5]:";
+    if (lowVerticalAcc) freeFallReason += "LowAccZ=" + String(accZ, 2) + ",";
+    if (nearZeroG) freeFallReason += "TotalAcc=" + String(totalAcceleration, 2) + ",";
+    if (rapidDescent) freeFallReason += "AltDrop=" + String(verticalVelocity, 2) + "m/s,";
+    if (lowLateralAcc) freeFallReason += "LowXY=" + String(lateralAcceleration, 2) + ",";
+    if (fallingDown) freeFallReason += "Falling";
+    
+    if (!freeFallConditionMet) {
+      freeFallConditionMet = true;
+      freeFallDetectionStart = millis();
+      
+      // Send detailed threshold alert
+      sendHC12Data("THRESHOLD:FREE FALL - Multi-Parameter Detection!");
+      sendHC12Data("THRESHOLD:Score=" + String(freeFallScore) + "/5 conditions met");
+      if (lowVerticalAcc) sendHC12Data("THRESHOLD:✓ Low Vertical Acc: " + String(accZ, 2) + " m/s²");
+      if (nearZeroG) sendHC12Data("THRESHOLD:✓ Near Zero-G: " + String(totalAcceleration, 2) + " m/s²");
+      if (rapidDescent) sendHC12Data("THRESHOLD:✓ Rapid Descent: " + String(verticalVelocity, 2) + " m/s");
+      if (lowLateralAcc) sendHC12Data("THRESHOLD:✓ Low Lateral Acc: " + String(lateralAcceleration, 2) + " m/s²");
+      if (fallingDown) sendHC12Data("THRESHOLD:✓ Vertical Velocity: " + String(verticalVelocity, 2) + " m/s");
+    }
+  }
+  
+  // ==================== CONDITION 2: EXCESSIVE ROLL ====================
+  bool rollExceeded = (fabs(roll) > ORIENTATION_THRESHOLD);
+  if (rollExceeded) {
+    if (!rollConditionMet) {
+      rollConditionMet = true;
+      rollDetectionStart = millis();
+      
+      String alert = "THRESHOLD:EXCESSIVE ROLL! Roll=" + String(roll, 2) + "° > " + String(ORIENTATION_THRESHOLD, 1) + "°";
+      sendHC12Data(alert);
+    }
+  }
+  
+  // ==================== CONDITION 3: EXCESSIVE PITCH ====================
+  bool pitchExceeded = (fabs(pitch) > ORIENTATION_THRESHOLD);
+  if (pitchExceeded) {
+    if (!pitchConditionMet) {
+      pitchConditionMet = true;
+      pitchDetectionStart = millis();
+      
+      String alert = "THRESHOLD:EXCESSIVE PITCH! Pitch=" + String(pitch, 2) + "° > " + String(ORIENTATION_THRESHOLD, 1) + "°";
+      sendHC12Data(alert);
+    }
+  }
+  
+  // ==================== CHECK WHICH CONDITIONS ARE ACTIVE ====================
+  bool anyConditionActive = advancedFreeFallDetected || rollExceeded || pitchExceeded;
+  
+  if (anyConditionActive) {
+    // Determine which condition was detected first
+    unsigned long earliestDetection = ULONG_MAX;
+    String deploymentReason = "";
+    
+    if (freeFallConditionMet && freeFallDetectionStart < earliestDetection) {
+      earliestDetection = freeFallDetectionStart;
+      deploymentReason = "FREE_FALL";
+      deploymentCondition = freeFallReason;
+    }
+    
+    if (rollConditionMet && rollDetectionStart < earliestDetection) {
+      earliestDetection = rollDetectionStart;
+      deploymentReason = "EXCESSIVE_ROLL";
+      deploymentCondition = "Excessive_Roll:" + String(roll, 2) + "°";
+    }
+    
+    if (pitchConditionMet && pitchDetectionStart < earliestDetection) {
+      earliestDetection = pitchDetectionStart;
+      deploymentReason = "EXCESSIVE_PITCH";
+      deploymentCondition = "Excessive_Pitch:" + String(pitch, 2) + "°";
+    }
+    
+    if (fallStartTime == 0) {
+      // First detection overall
+      fallStartTime = earliestDetection;
+      triggerReason = deploymentCondition;
+      storeDetectionValues(timestamp, altitude, roll, pitch, accX, accY, accZ, totalAcceleration, verticalVelocity);
+      
+      Serial.println("\n⚠️  POTENTIAL DEPLOYMENT CONDITION DETECTED");
+      Serial.println("⏳ Beginning confirmation period...");
+      Serial.println("📊 Condition: " + deploymentReason);
+      logData("CONDITION_DETECTED", "Confirming: " + deploymentCondition);
+      
+      // Send alerts via HC-12
+      sendHC12Data("ALERT:⚠️ DEPLOYMENT CONDITION DETECTED!");
+      sendHC12Data("ALERT:Condition: " + deploymentReason);
+      sendHC12Data("ALERT:Details: " + deploymentCondition);
+      sendHC12Data("ALERT:Confirmation period started");
+      
+      blinkLED(statusLedPin, 100);
+      blinkLED(deployLedPin, 100);
+    }
+    else if (millis() - fallStartTime >= CONFIRMATION_TIME) {
+      // Confirmed deployment condition
+      deployParachute(timestamp, deploymentReason);
+    }
+    else {
+      // Send countdown update
+      unsigned long remaining = CONFIRMATION_TIME - (millis() - fallStartTime);
+      String countdownMsg = "COUNTDOWN:Confirming " + deploymentReason + "... " + String(remaining) + "ms remaining";
+      sendHC12Data(countdownMsg);
+    }
+  }
+  else {
+    // All conditions cleared
+    if (fallStartTime != 0) {
+      Serial.println("✅ All deployment conditions cleared");
+      logData("CONDITION_CLEARED", "Deployment detection reset");
+      
+      // Send clear alert via HC-12
+      sendHC12Data("ALERT:✅ All Conditions Cleared - Reset");
+      sendHC12Data("STATUS:Monitoring resumed");
+      
+      fallStartTime = 0;
+      freeFallConditionMet = false;
+      rollConditionMet = false;
+      pitchConditionMet = false;
+      digitalWrite(statusLedPin, HIGH);
+      digitalWrite(deployLedPin, HIGH);
+    }
+  }
+}
+
+void storeDetectionValues(float timestamp, float altitude, float roll, float pitch, 
+                         float accX, float accY, float accZ, float totalAcc, float vertVel) {
+  detectionTimestamp = timestamp;
+  detectionAltitude = altitude;
+  detectionRoll = roll;
+  detectionPitch = pitch;
+  detectionAccX = accX;
+  detectionAccY = accY;
+  detectionAccZ = accZ;
+  detectionTotalAcc = totalAcc;
+  detectionVerticalVelocity = vertVel;
+}
+
+void deployParachute(float timestamp, String reason) {
+  parachuteDeployed = true;
+  
+  // Deploy parachute
+  parachuteServo.write(90);
+  Serial.println("\n🎯 PARACHUTE DEPLOYED!");
+  Serial.println("🛑 SERVO ACTIVATED");
+  Serial.println("📋 DEPLOYMENT REASON: " + reason);
+  
+  // Create detailed deployment log
+  String deployDetails = "Deployment_Time:" + String(detectionTimestamp, 3) + "s";
+  deployDetails += " | Reason:" + reason;
+  deployDetails += " | Altitude:" + String(detectionAltitude, 3) + "m";
+  deployDetails += " | Roll:" + String(detectionRoll, 3) + "°";
+  deployDetails += " | Pitch:" + String(detectionPitch, 3) + "°";
+  deployDetails += " | AccZ:" + String(detectionAccZ, 3) + "m/s²";
+  deployDetails += " | TotalAcc:" + String(detectionTotalAcc, 3) + "m/s²";
+  deployDetails += " | VertVel:" + String(detectionVerticalVelocity, 3) + "m/s";
+  deployDetails += " | Trigger:" + triggerReason;
+  
+  logData("PARACHUTE_DEPLOYED", deployDetails);
+  
+  // Send deployment alerts via HC-12 with deployment reason
+  sendHC12Data("DEPLOY:🎯 PARACHUTE DEPLOYED!");
+  sendHC12Data("DEPLOY:🛑 SERVO ACTIVATED");
+  sendHC12Data("DEPLOY:━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  sendHC12Data("DEPLOY:REASON: " + reason);
+  sendHC12Data("DEPLOY:━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  sendHC12Data("DEPLOY:Time=" + String(detectionTimestamp, 3) + "s");
+  sendHC12Data("DEPLOY:Altitude=" + String(detectionAltitude, 3) + "m");
+  sendHC12Data("DEPLOY:Roll=" + String(detectionRoll, 3) + "°");
+  sendHC12Data("DEPLOY:Pitch=" + String(detectionPitch, 3) + "°");
+  sendHC12Data("DEPLOY:AccZ=" + String(detectionAccZ, 3) + "m/s²");
+  sendHC12Data("DEPLOY:TotalAcc=" + String(detectionTotalAcc, 3) + "m/s²");
+  sendHC12Data("DEPLOY:VerticalVel=" + String(detectionVerticalVelocity, 3) + "m/s");
+  sendHC12Data("DEPLOY:Details=" + triggerReason);
+  
+  // Visual indication
+  digitalWrite(statusLedPin, LOW);
+  
+  // Continuous deployment message
+  unsigned long lastDeployMsgTime = 0;
+  while (true) {
+    if (millis() - lastDeployMsgTime >= 2000) {
+      lastDeployMsgTime = millis();
+      logData("PARACHUTE_STATUS", "Deployed successfully - Reason: " + reason);
+      sendHC12Data("STATUS:Parachute deployed - " + reason);
+    }
+    blinkLED(deployLedPin, 500);
+    delay(100);
+  }
+}
+
+bool initializeSDCard() {
+  Serial.print("Initializing SD Card... ");
+  
+  if (!SD.begin(chipSelect, SPI, 4000000)) {
+    Serial.println("FAILED");
+    return false;
+  }
+  
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("NO CARD");
+    return false;
+  }
+  
+  // Find next session number
+  sessionNumber = 1;
+  while (SD.exists("/session" + String(sessionNumber) + ".csv")) {
+    sessionNumber++;
+  }
+  
+  fileName = "/session" + String(sessionNumber) + ".csv";
+  
+  dataFile = SD.open(fileName, FILE_WRITE);
+  if (!dataFile) {
+    Serial.println("FILE CREATION FAILED");
+    return false;
+  }
+  dataFile.close();
+  
+  Serial.println("SUCCESS");
+  Serial.printf("Session: %d, File: %s\n", sessionNumber, fileName.c_str());
+  Serial.printf("Card Size: %.1f MB\n", SD.cardSize() / (1024.0 * 1024.0));
+  
+  sdInitialized = true;
+  return true;
+}
+
+void logSessionHeader() {
+  if (!sdInitialized) return;
+  
+  dataFile = SD.open(fileName, FILE_WRITE);
+  if (dataFile) {
+    dataFile.println("========================================================================================================================");
+    dataFile.println("PARACHUTE EJECTION SYSTEM - FLIGHT DATA LOG (ADVANCED FREE FALL DETECTION)");
+    dataFile.println("SESSION: " + String(sessionNumber));
+    dataFile.println("SENSORS: MS5611=" + String(ms5611Available ? "ACTIVE" : "INACTIVE") + 
+                    ", BMP280=" + String(bmp280Available ? "ACTIVE" : "INACTIVE"));
+    dataFile.println("FREE FALL DETECTION: Multi-Parameter (5 conditions)");
+    dataFile.println("DATA RATE: High-Speed (200ms logging, 500ms telemetry)");
+    dataFile.println("========================================================================================================================");
+    dataFile.println("Timestamp(s)     , Roll(deg)     , Pitch(deg)    , AccX(m/s2)    , AccY(m/s2)    , AccZ(m/s2)    , Altitude(m)    , Status");
+    dataFile.println("========================================================================================================================");
+    dataFile.close();
+  }
+}
+
+void logColumnHeaders() {
+  if (!sdInitialized) return;
+  
+  dataFile = SD.open(fileName, FILE_APPEND);
+  if (dataFile) {
+    dataFile.println("========================================================================================================================");
+    dataFile.println("Timestamp(s)     , Roll(deg)     , Pitch(deg)    , AccX(m/s2)    , AccY(m/s2)    , AccZ(m/s2)    , Altitude(m)    , Status");
+    dataFile.println("========================================================================================================================");
+    dataFile.close();
+  }
+}
+
+void logData(String eventType, String message) {
+  String timestamp = String((millis() - systemStartTime) / 1000.0, 3);
+  String logLine = timestamp + "     , " + eventType + "     , " + message;
+  
+  Serial.println("LOG: " + logLine);
+  
+  if (sdInitialized) {
+    dataFile = SD.open(fileName, FILE_APPEND);
+    if (dataFile) {
+      dataFile.println(logLine);
+      dataFile.close();
+    }
+  }
+}
+
+void logSensorData(float timestamp, float roll, float pitch, float accX, float accY, float accZ, float altitude, String status) {
+  String dataLine = String(timestamp, 3) + "     , ";
+  dataLine += String(roll, 6) + "     , ";
+  dataLine += String(pitch, 6) + "     , ";
+  dataLine += String(accX, 6) + "     , ";
+  dataLine += String(accY, 6) + "     , ";
+  dataLine += String(accZ, 6) + "     , ";
+  dataLine += String(altitude, 6) + "     , ";
+  dataLine += status;
+  
+  if (sdInitialized) {
+    dataFile = SD.open(fileName, FILE_APPEND);
+    if (dataFile) {
+      dataFile.println(dataLine);
+      dataFile.close();
+    }
+  }
+}
+
+bool initializeMPU6050() {
+  Serial.print("Initializing MPU6050... ");
+  if (!mpu.begin()) {
+    Serial.println("FAILED");
+    return false;
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("SUCCESS");
+  return true;
+}
+
+bool initializeMS5611() {
+  Serial.print("Initializing MS5611 (Primary)... ");
+  if (!ms5611.begin()) {
+    Serial.println("FAILED");
+    return false;
+  }
+  Serial.println("SUCCESS");
+  return true;
+}
+
+bool initializeBMP280() {
+  Serial.print("Initializing BMP280 (Secondary)... ");
+  // Try default I2C address 0x76, if fails try 0x77
+  if (!bmp280.begin(0x76)) {
+    Serial.print("Address 0x76 failed, trying 0x77... ");
+    if (!bmp280.begin(0x77)) {
+      Serial.println("FAILED");
+      return false;
+    }
+  }
+  
+  // Configure BMP280 for high accuracy
+  bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,     // Operating Mode
+                    Adafruit_BMP280::SAMPLING_X2,      // Temperature oversampling
+                    Adafruit_BMP280::SAMPLING_X16,     // Pressure oversampling
+                    Adafruit_BMP280::FILTER_X16,       // Filtering
+                    Adafruit_BMP280::STANDBY_MS_500);  // Standby time
+  
+  Serial.println("SUCCESS");
+  return true;
+}
+
+void calibrateAltitudeDualSensor() {
+  Serial.println("\n=== DUAL SENSOR ALTITUDE CALIBRATION ===");
+  sendHC12Data("STATUS:Calibrating dual sensors...");
+  
+  const int numReadings = 50;
+  float sumPressureMS5611 = 0;
+  float sumPressureBMP280 = 0;
+  int validMS5611 = 0;
+  int validBMP280 = 0;
+  
+  for (int i = 0; i < numReadings; i++) {
+    if (ms5611Available) {
+      ms5611.read();
+      float pressMS = ms5611.getPressure();
+      if (pressMS > 0) {
+        sumPressureMS5611 += pressMS;
+        validMS5611++;
+      }
+    }
+    
+    if (bmp280Available) {
+      float pressBMP = bmp280.readPressure() / 100.0; // Convert Pa to hPa
+      if (pressBMP > 0) {
+        sumPressureBMP280 += pressBMP;
+        validBMP280++;
+      }
+    }
+    
+    delay(20);
+    if (i % 10 == 0) Serial.print(".");
+  }
+  
+  Serial.println();
+  
+  if (validMS5611 > 0) {
+    referencePressureMS5611 = sumPressureMS5611 / validMS5611;
+    Serial.printf("MS5611 Reference Pressure: %.2f hPa (%d valid readings)\n", 
+                  referencePressureMS5611, validMS5611);
+    sendHC12Data("CALIBRATION:MS5611_RefPress=" + String(referencePressureMS5611, 2) + "hPa");
+  }
+  
+  if (validBMP280 > 0) {
+    referencePressureBMP280 = sumPressureBMP280 / validBMP280;
+    Serial.printf("BMP280 Reference Pressure: %.2f hPa (%d valid readings)\n", 
+                  referencePressureBMP280, validBMP280);
+    sendHC12Data("CALIBRATION:BMP280_RefPress=" + String(referencePressureBMP280, 2) + "hPa");
+  }
+  
+  // Calculate initial sensor variance for adaptive weighting
+  updateSensorWeights();
+  
+  Serial.printf("Initial Sensor Weights: MS5611=%.3f, BMP280=%.3f\n", ms5611Weight, bmp280Weight);
+  sendHC12Data("CALIBRATION:Weights MS5611=" + String(ms5611Weight, 3) + 
+               " BMP280=" + String(bmp280Weight, 3));
+  
+  Serial.println("=== CALIBRATION COMPLETE ===\n");
+}
+
+float calculateAltitude(float pressure, float referencePressure) {
+  if (pressure > 0 && referencePressure > 0) {
+    return 44330.0 * (1.0 - pow(pressure / referencePressure, 0.1903));
+  }
+  return 0.0;
+}
+
+void readAndFuseAltitude() {
+  float altMS5611 = 0;
+  float altBMP280 = 0;
+  bool ms5611Valid = false;
+  bool bmp280Valid = false;
+  
+  // Read MS5611
+  if (ms5611Available) {
+    ms5611.read();
+    float pressMS = ms5611.getPressure();
+    if (pressMS > 0) {
+      altMS5611 = calculateAltitude(pressMS, referencePressureMS5611);
+      ms5611Valid = true;
+      
+      // Store for reliability tracking
+      ms5611ReadingsHistory[reliabilityIndex] = altMS5611;
+    }
+  }
+  
+  // Read BMP280
+  if (bmp280Available) {
+    float pressBMP = bmp280.readPressure() / 100.0; // Convert Pa to hPa
+    if (pressBMP > 0) {
+      altBMP280 = calculateAltitude(pressBMP, referencePressureBMP280);
+      bmp280Valid = true;
+      
+      // Store for reliability tracking
+      bmp280ReadingsHistory[reliabilityIndex] = altBMP280;
+    }
+  }
+  
+  reliabilityIndex = (reliabilityIndex + 1) % RELIABILITY_WINDOW;
+  
+  // Fuse altitude readings using weighted average
+  float fusedAltitude = 0;
+  
+  if (ms5611Valid && bmp280Valid) {
+    // Both sensors valid - use weighted fusion
+    fusedAltitude = (altMS5611 * ms5611Weight) + (altBMP280 * bmp280Weight);
+    
+    // Apply Kalman filter for smoothing
+    fusedAltitude = applyKalmanFilter(fusedAltitude);
+    
+    // Update sensor weights based on variance
+    if (reliabilityIndex == 0) { // Update weights every cycle
+      updateSensorWeights();
+    }
+  }
+  else if (ms5611Valid) {
+    // Only MS5611 valid
+    fusedAltitude = applyKalmanFilter(altMS5611);
+    ms5611Weight = 1.0;
+    bmp280Weight = 0.0;
+  }
+  else if (bmp280Valid) {
+    // Only BMP280 valid
+    fusedAltitude = applyKalmanFilter(altBMP280);
+    ms5611Weight = 0.0;
+    bmp280Weight = 1.0;
+  }
+  else {
+    // No valid readings - use last known altitude
+    fusedAltitude = lastFusedAltitude;
+    sendHC12Data("WARNING:No valid altitude readings");
+  }
+  
+  // Add to moving average filter
+  altitudeSum -= altitudeReadings[altitudeReadingsIndex];
+  altitudeReadings[altitudeReadingsIndex] = fusedAltitude;
+  altitudeSum += fusedAltitude;
+  
+  altitudeReadingsIndex = (altitudeReadingsIndex + 1) % ALTITUDE_FILTER_SIZE;
+  if (altitudeReadingsIndex == 0) altitudeFilterFilled = true;
+  
+  lastFusedAltitude = fusedAltitude;
+}
+
+float applyKalmanFilter(float measurement) {
+  // Prediction step
+  float predictedAltitude = lastFusedAltitude + altitudeVelocity;
+  kalmanP = kalmanP + KALMAN_Q;
+  
+  // Update step
+  float kalmanK = kalmanP / (kalmanP + KALMAN_R);
+  float filteredAltitude = predictedAltitude + kalmanK * (measurement - predictedAltitude);
+  kalmanP = (1 - kalmanK) * kalmanP;
+  
+  // Update velocity estimate
+  altitudeVelocity = filteredAltitude - lastFusedAltitude;
+  
+  return filteredAltitude;
+}
+
+void updateSensorWeights() {
+  // Calculate variance for each sensor
+  float ms5611Variance = 0;
+  float bmp280Variance = 0;
+  
+  if (ms5611Available) {
+    float ms5611Mean = 0;
+    for (int i = 0; i < RELIABILITY_WINDOW; i++) {
+      ms5611Mean += ms5611ReadingsHistory[i];
+    }
+    ms5611Mean /= RELIABILITY_WINDOW;
+    
+    for (int i = 0; i < RELIABILITY_WINDOW; i++) {
+      float diff = ms5611ReadingsHistory[i] - ms5611Mean;
+      ms5611Variance += diff * diff;
+    }
+    ms5611Variance /= RELIABILITY_WINDOW;
+  }
+  
+  if (bmp280Available) {
+    float bmp280Mean = 0;
+    for (int i = 0; i < RELIABILITY_WINDOW; i++) {
+      bmp280Mean += bmp280ReadingsHistory[i];
+    }
+    bmp280Mean /= RELIABILITY_WINDOW;
+    
+    for (int i = 0; i < RELIABILITY_WINDOW; i++) {
+      float diff = bmp280ReadingsHistory[i] - bmp280Mean;
+      bmp280Variance += diff * diff;
+    }
+    bmp280Variance /= RELIABILITY_WINDOW;
+  }
+  
+  // Calculate weights inversely proportional to variance
+  // Lower variance = higher weight (more reliable)
+  if (ms5611Available && bmp280Available) {
+    if (ms5611Variance > 0 && bmp280Variance > 0) {
+      float ms5611Precision = 1.0 / (ms5611Variance + 0.001); // Add small value to avoid division by zero
+      float bmp280Precision = 1.0 / (bmp280Variance + 0.001);
+      
+      float totalPrecision = ms5611Precision + bmp280Precision;
+      
+      ms5611Weight = ms5611Precision / totalPrecision;
+      bmp280Weight = bmp280Precision / totalPrecision;
+      
+      // Apply smoothing to weight changes
+      const float WEIGHT_SMOOTHING = 0.9;
+      static float lastMS5611Weight = 0.5;
+      static float lastBMP280Weight = 0.5;
+      
+      ms5611Weight = WEIGHT_SMOOTHING * lastMS5611Weight + (1 - WEIGHT_SMOOTHING) * ms5611Weight;
+      bmp280Weight = WEIGHT_SMOOTHING * lastBMP280Weight + (1 - WEIGHT_SMOOTHING) * bmp280Weight;
+      
+      lastMS5611Weight = ms5611Weight;
+      lastBMP280Weight = bmp280Weight;
+    }
+  }
+  else if (ms5611Available) {
+    ms5611Weight = 1.0;
+    bmp280Weight = 0.0;
+  }
+  else if (bmp280Available) {
+    ms5611Weight = 0.0;
+    bmp280Weight = 1.0;
+  }
+}
+
+float getSmoothedAltitude() {
+  int count = altitudeFilterFilled ? ALTITUDE_FILTER_SIZE : altitudeReadingsIndex;
+  return count > 0 ? altitudeSum / count : 0;
+}
+
+void readMPU6050(float &roll, float &pitch, float &accX, float &accY, float &accZ) {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  accX = a.acceleration.x;
+  accY = a.acceleration.y;
+  accZ = a.acceleration.z;
+  
+  roll = atan2(accY, accZ) * 180 / PI;
+  pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * 180 / PI;
+}
+
+void systemHalt(String message) {
+  Serial.println("❌ CRITICAL ERROR: " + message);
+  logData("SYSTEM_HALT", message);
+  
+  // Send error via HC-12
+  sendHC12Data("ERROR:❌ CRITICAL ERROR!");
+  sendHC12Data("ERROR:" + message);
+  sendHC12Data("STATUS:SYSTEM HALTED");
+  
+  while (true) {
+    blinkLED(statusLedPin, 200);
+    blinkLED(deployLedPin, 200);
+    delay(100);
+  }
+}
+
+void initializeAltitudeFilter() {
+  for (int i = 0; i < ALTITUDE_FILTER_SIZE; i++) {
+    altitudeReadings[i] = 0.0;
+  }
+  altitudeSum = 0;
+  altitudeReadingsIndex = 0;
+  altitudeFilterFilled = false;
+  
+  // Initialize reliability tracking arrays
+  for (int i = 0; i < RELIABILITY_WINDOW; i++) {
+    ms5611ReadingsHistory[i] = 0.0;
+    bmp280ReadingsHistory[i] = 0.0;
+  }
+  
+  // Initialize altitude history
+  for (int i = 0; i < ALTITUDE_HISTORY_SIZE; i++) {
+    altitudeHistory[i] = 0.0;
+    altitudeTimeHistory[i] = 0;
+  }
+}
+
+void blinkLED(int ledPin, int interval) {
+  static unsigned long lastBlink = 0;
+  static bool ledState = false;
+  
+  if (millis() - lastBlink >= interval) {
+    ledState = !ledState;
+    digitalWrite(ledPin, ledState);
+    lastBlink = millis();
+  }
+}
