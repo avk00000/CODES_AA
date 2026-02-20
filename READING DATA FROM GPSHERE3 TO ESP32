@@ -1,0 +1,64 @@
+#include <Arduino.h>
+#include "driver/twai.h"
+
+// ESP32 CAN pins (connect to VP230)
+#define CAN_TX GPIO_NUM_21
+#define CAN_RX GPIO_NUM_22
+
+// HERE3 DroneCAN GNSS message (Fix2)
+#define DRONECAN_GNSS_FIX2_ID 0x10F   // standard broadcast ID
+
+void setupCAN()
+{
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL);
+    twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_1MBITS();   // HERE3 = 1 Mbps
+    twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
+    ESP_ERROR_CHECK(twai_start());
+
+    Serial.println("✅ CAN Started (1 Mbps)");
+}
+
+void decodeGNSS(const twai_message_t &msg)
+{
+    if (msg.data_length_code < 16) return;
+
+    // DroneCAN uses little-endian packed data
+    int32_t lat  = (msg.data[0]  | msg.data[1]<<8  | msg.data[2]<<16 | msg.data[3]<<24);
+    int32_t lon  = (msg.data[4]  | msg.data[5]<<8  | msg.data[6]<<16 | msg.data[7]<<24);
+    int32_t alt  = (msg.data[8]  | msg.data[9]<<8  | msg.data[10]<<16| msg.data[11]<<24);
+    uint8_t fix  = msg.data[12];
+    uint8_t sats = msg.data[13];
+
+    Serial.println("\n📡 HERE3 GPS DATA");
+    Serial.printf("Lat: %.7f\n", lat / 1e7);
+    Serial.printf("Lon: %.7f\n", lon / 1e7);
+    Serial.printf("Alt: %.2f m\n", alt / 1000.0);
+    Serial.printf("Fix: %d  Sats: %d\n", fix, sats);
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(2000);
+
+    Serial.println("Starting HERE3 Listener...");
+    setupCAN();
+}
+
+void loop()
+{
+    twai_message_t msg;
+
+    if (twai_receive(&msg, pdMS_TO_TICKS(1000)) == ESP_OK)
+    {
+        // Print every frame to confirm bus activity
+        Serial.printf("ID: 0x%03X  DLC:%d\n", msg.identifier, msg.data_length_code);
+
+        if (msg.identifier == DRONECAN_GNSS_FIX2_ID)
+        {
+            decodeGNSS(msg);
+        }
+    }
+}
